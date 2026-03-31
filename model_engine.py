@@ -37,6 +37,12 @@ MODEL_ID = "google/medgemma-1.5-4b-it"
 # Maximum new tokens to generate; large enough for a full radiology report
 MAX_NEW_TOKENS = 1024
 
+# Repetition control — prevents the model looping on the same phrase
+# repetition_penalty > 1.0 down-weights tokens already in the context window.
+# no_repeat_ngram_size blocks any n-gram from appearing more than once.
+REPETITION_PENALTY   = 1.3
+NO_REPEAT_NGRAM_SIZE = 4
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Hardware detection helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,7 +284,9 @@ def generate_inference(
             output_ids = model.generate(
                 **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False,        # greedy decoding for reproducibility
+                do_sample=False,              # greedy decoding for reproducibility
+                repetition_penalty=REPETITION_PENALTY,
+                no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
             )
     except torch.cuda.OutOfMemoryError as oom:
         torch.cuda.empty_cache()
