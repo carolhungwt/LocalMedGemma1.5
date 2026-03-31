@@ -154,37 +154,36 @@ def _build_multimodal_messages(
     task_config: TaskConfig,
 ) -> list[dict]:
     """
-    Build the `messages` list consumed by `processor.apply_chat_template`.
+    Build the `messages` list for `processor.apply_chat_template`.
 
-    Structure
-    ---------
+    Gemma 3 / MedGemma 1.5 constraints
+    ────────────────────────────────────
+    • The chat template does NOT support a "system" role — the system prompt
+      is prepended to the user text content instead.
+    • Image tokens must appear AFTER the text token in the content list,
+      matching the high-dimensional CT notebook convention.
+
+    Resulting structure
+    -------------------
     [
-      { "role": "system",  "content": [{"type": "text", "text": SYSTEM_PROMPT}] },
       { "role": "user",
         "content": [
-          {"type": "text",  "text": <user prompt>},
-          {"type": "image"},   # repeated once per image slice
+          {"type": "text",  "text": "<system_prompt>\\n\\n<user_prompt>"},
+          {"type": "image"},   # one entry per image slice
           ...
         ]
-      },
+      }
     ]
-
-    Placing the text token before the image tokens matches the MedGemma
-    high-dimensional CT notebook convention.
     """
-    image_tokens = [{"type": "image"} for _ in images]
+    combined_text = f"{task_config.system_prompt}\n\n{task_config.user_prompt}"
+    image_tokens  = [{"type": "image"} for _ in images]
 
-    messages = [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": task_config.system_prompt}],
-        },
+    return [
         {
             "role": "user",
-            "content": [{"type": "text", "text": task_config.user_prompt}] + image_tokens,
-        },
+            "content": [{"type": "text", "text": combined_text}] + image_tokens,
+        }
     ]
-    return messages
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,11 +201,21 @@ def generate_inference(
     Run a single multimodal inference pass through MedGemma and return the
     cleaned output text.
 
+    Two-step processor call (required by Gemma3Processor)
+    ──────────────────────────────────────────────────────
+    Step 1 — apply_chat_template(..., tokenize=False)
+        Returns a plain formatted string.  Gemma3Processor does NOT accept
+        images=, return_tensors=, or return_dict= here.
+
+    Step 2 — processor(text=..., images=..., return_tensors="pt")
+        Tokenises the text and encodes the images together into model-ready
+        tensors.
+
     Parameters
     ----------
     images      : list of RGB PIL Images (one per slice/frame)
     task_config : TaskConfig from prompts.build_task_config()
-    processor   : loaded AutoProcessor
+    processor   : loaded AutoProcessor (Gemma3Processor)
     model       : loaded AutoModelForImageTextToText
     hw          : hardware info dict from get_hardware_info()
 
@@ -224,24 +233,33 @@ def generate_inference(
 
     messages = _build_multimodal_messages(images, task_config)
 
-    # apply_chat_template returns a fully formatted prompt string; tokenise it
-    # along with the image list into model inputs.
+    # ── Step 1: format the chat into a plain string ──────────────────────────
     try:
-        inputs = processor.apply_chat_template(
+        prompt_text: str = processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            images=images,
+            tokenize=False,         # returns str — images are NOT passed here
         )
     except Exception as exc:
         raise RuntimeError(
-            f"Processor failed to build inputs: {exc}\n"
-            "Ensure the number of {{type: image}} tokens matches len(images)."
+            f"apply_chat_template failed: {exc}"
         ) from exc
 
-    # Move all tensors to the model's device and correct dtype
+    # ── Step 2: tokenise text + encode images into tensors ───────────────────
+    try:
+        inputs = processor(
+            text=prompt_text,
+            images=images,
+            return_tensors="pt",
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Processor failed to encode inputs: {exc}\n"
+            "Check that the number of <image> placeholders in the prompt "
+            "matches len(images)."
+        ) from exc
+
+    # Move all tensors to the model's device; cast floating-point tensors only
     model_device = next(model.parameters()).device
     model_dtype  = next(model.parameters()).dtype
 
@@ -253,12 +271,13 @@ def generate_inference(
 
     input_len = inputs["input_ids"].shape[-1]
 
+    # ── Step 3: generate ─────────────────────────────────────────────────────
     try:
         with torch.inference_mode():
             output_ids = model.generate(
                 **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False,          # greedy decoding for reproducibility
+                do_sample=False,        # greedy decoding for reproducibility
             )
     except torch.cuda.OutOfMemoryError as oom:
         torch.cuda.empty_cache()
@@ -273,7 +292,7 @@ def generate_inference(
     except Exception as exc:
         raise RuntimeError(f"Model generation failed: {exc}") from exc
 
-    # Decode only the newly generated tokens (skip the prompt echo)
+    # Decode only the newly generated tokens (exclude the echoed prompt)
     generated_ids = output_ids[0][input_len:]
     raw_text = processor.decode(generated_ids, skip_special_tokens=True)
 
