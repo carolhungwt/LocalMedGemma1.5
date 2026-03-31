@@ -28,7 +28,8 @@ from PIL import Image
 import data_utils as du
 import model_engine as me
 from prompts import (
-    Task, Modality, MODALITY_SHORT,
+    Task, Modality, MODALITY_SHORT, MODALITY_REGIONS,
+    BodyRegion, XRayView,
     build_task_config, CUSTOM_PROMPT_PLACEHOLDER,
 )
 
@@ -175,8 +176,6 @@ with st.sidebar:
     # ── Imaging modality selector ────────────────────────────────────────────
     st.markdown('<p class="sidebar-section">Imaging Modality</p>', unsafe_allow_html=True)
 
-    # If DICOM files were already parsed and a modality was auto-detected,
-    # pre-select it in the dropdown; user can always override manually.
     auto_detected: Modality = st.session_state.get("detected_modality", Modality.AUTO)
     modality_options = [m.value for m in Modality]
     default_idx = modality_options.index(auto_detected.value)
@@ -195,10 +194,79 @@ with st.sidebar:
     )
     selected_modality = Modality(selected_modality_val)
 
-    if auto_detected != Modality.AUTO and auto_detected != Modality.OTHER:
+    if auto_detected not in (Modality.AUTO, Modality.OTHER):
         st.caption(f"Auto-detected from DICOM tag: **{MODALITY_SHORT[auto_detected]}**")
     elif auto_detected == Modality.OTHER:
         st.caption("DICOM tag present but modality unrecognised — please select manually.")
+
+    # ── Anatomical region selector ───────────────────────────────────────────
+    # Shown for every modality so the user can scope the report.
+    # Options are filtered to the clinically relevant subset for the chosen
+    # modality; UNSPECIFIED is always the first / default option.
+    st.markdown('<p class="sidebar-section">Anatomical Region</p>', unsafe_allow_html=True)
+
+    applicable_regions = MODALITY_REGIONS.get(selected_modality, list(BodyRegion))
+    # Ensure UNSPECIFIED is always first even if missing from the filtered list
+    region_options = [BodyRegion.UNSPECIFIED] + [
+        r for r in applicable_regions if r != BodyRegion.UNSPECIFIED
+    ]
+
+    # Reset region selection when modality changes so a stale value is not kept
+    if "last_modality" not in st.session_state:
+        st.session_state.last_modality = selected_modality
+    if st.session_state.last_modality != selected_modality:
+        st.session_state.last_modality  = selected_modality
+        st.session_state.selected_region = BodyRegion.UNSPECIFIED
+
+    region_values = [r.value for r in region_options]
+    saved_region  = st.session_state.get("selected_region", BodyRegion.UNSPECIFIED)
+    region_idx    = (
+        region_values.index(saved_region.value)
+        if saved_region.value in region_values
+        else 0
+    )
+
+    selected_region_val = st.selectbox(
+        "Region",
+        options=region_values,
+        index=region_idx,
+        label_visibility="collapsed",
+        help=(
+            "Narrows the report to the selected anatomical area. "
+            "Choose 'Not specified' to let the model describe all visible anatomy."
+        ),
+    )
+    selected_region = BodyRegion(selected_region_val)
+    st.session_state.selected_region = selected_region
+
+    # ── X-Ray view / projection selector ────────────────────────────────────
+    # Only shown when the modality is X-Ray.
+    selected_xray_view  = XRayView.UNSPECIFIED
+    custom_view_text    = ""
+
+    if selected_modality == Modality.XRAY:
+        st.markdown('<p class="sidebar-section">Radiographic View</p>', unsafe_allow_html=True)
+
+        view_options = [v.value for v in XRayView]
+        selected_view_val = st.selectbox(
+            "View",
+            options=view_options,
+            index=0,
+            label_visibility="collapsed",
+            help=(
+                "Specifies the projection used for acquisition. This is injected "
+                "directly into the prompt so the model applies the correct "
+                "anatomical orientation (e.g. PA vs AP heart size conventions)."
+            ),
+        )
+        selected_xray_view = XRayView(selected_view_val)
+
+        if selected_xray_view == XRayView.CUSTOM:
+            custom_view_text = st.text_input(
+                "Custom projection name",
+                placeholder="e.g. Judet, Sunrise, Tunnel, Mortise…",
+                help="Enter any non-standard projection name.",
+            )
 
     st.divider()
 
@@ -361,6 +429,9 @@ with right_col:
                 disease=disease_name,
                 custom_prompt=custom_prompt,
                 modality=selected_modality,
+                region=selected_region,
+                xray_view=selected_xray_view,
+                custom_view=custom_view_text,
             )
         except ValueError as ve:
             st.session_state.report_error = str(ve)
