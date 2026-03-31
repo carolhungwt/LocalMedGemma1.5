@@ -121,13 +121,14 @@ def load_model(hf_token: Optional[str] = None) -> tuple:
         processor = AutoProcessor.from_pretrained(
             MODEL_ID,
             token=token,
+            use_fast=True,          # suppress slow-processor deprecation warning
             trust_remote_code=True,
         )
 
         model = AutoModelForImageTextToText.from_pretrained(
             MODEL_ID,
             token=token,
-            torch_dtype=hw["dtype"],
+            dtype=hw["dtype"],      # torch_dtype= is deprecated; use dtype=
             device_map="auto",
             trust_remote_code=True,
         )
