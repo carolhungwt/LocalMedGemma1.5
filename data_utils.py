@@ -8,6 +8,11 @@ Supported inputs
   • Standard images  : .jpg / .jpeg / .png / .bmp / .tiff
   • Video files      : .mp4 / .mov / .avi
   • DICOM slices     : .dcm  (single file OR a list of files forming a volume)
+
+Modality auto-detection
+  For DICOM inputs, the DICOM Modality tag (0008,0060) is read from the first
+  valid file and mapped to the application's Modality enum.  Non-DICOM inputs
+  return Modality.AUTO so the user can specify or let the model infer.
 """
 
 from __future__ import annotations
@@ -21,6 +26,8 @@ import numpy as np
 import pydicom
 from PIL import Image
 
+from prompts import Modality
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -31,6 +38,61 @@ SUPPORTED_DICOM_EXTENSIONS = {".dcm"}
 
 DEFAULT_VIDEO_SLICES = 16   # uniformly spaced frames extracted from a video
 MAX_DICOM_PREVIEW    = 64   # cap for preview slider performance
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DICOM Modality tag (0008,0060) → Modality enum
+# Source: DICOM PS3.3 C.7.3.1.1.1
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DICOM_MODALITY_MAP: dict[str, Modality] = {
+    # X-Ray / Radiography
+    "CR" : Modality.XRAY,   # Computed Radiography
+    "DX" : Modality.XRAY,   # Digital Radiography
+    "RG" : Modality.XRAY,   # Radiographic imaging
+    "PX" : Modality.XRAY,   # Panoramic X-Ray
+    # CT
+    "CT" : Modality.CT,
+    # MRI
+    "MR" : Modality.MRI,
+    "MG" : Modality.MAMMOGRAPHY,
+    # Ultrasound
+    "US" : Modality.ULTRASOUND,
+    "IVUS": Modality.ULTRASOUND,
+    # Nuclear medicine / PET
+    "PT" : Modality.PET,    # PET
+    "NM" : Modality.PET,    # Nuclear Medicine
+    # Fluoroscopy / Angiography
+    "XA" : Modality.FLUOROSCOPY,
+    "RF" : Modality.FLUOROSCOPY,  # Radio Fluoroscopy
+    "DSA": Modality.FLUOROSCOPY,
+}
+
+
+def detect_dicom_modality(file: BinaryIO) -> Modality:
+    """
+    Read the DICOM Modality tag (0008,0060) from *file* and return the
+    corresponding Modality enum value.
+
+    The file's read position is reset to 0 after reading so it can be
+    passed to subsequent DICOM loaders without seeking manually.
+
+    Parameters
+    ----------
+    file : file-like object (supports .read() and .seek())
+
+    Returns
+    -------
+    Modality  — Modality.OTHER if the tag is absent or unrecognised
+    """
+    try:
+        raw = file.read()
+        if hasattr(file, "seek"):
+            file.seek(0)
+        ds = pydicom.dcmread(io.BytesIO(raw), stop_before_pixels=True)
+        tag_value = str(getattr(ds, "Modality", "")).strip().upper()
+        return _DICOM_MODALITY_MAP.get(tag_value, Modality.OTHER)
+    except Exception:
+        return Modality.OTHER
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,10 +277,11 @@ def load_dicom_series(files: list[BinaryIO]) -> list[Image.Image]:
 def process_uploaded_files(
     uploaded_files: list,
     num_video_slices: int = DEFAULT_VIDEO_SLICES,
-) -> tuple[list[Image.Image], str]:
+) -> tuple[list[Image.Image], str, Modality]:
     """
     Top-level dispatcher: inspect the uploaded file(s) and return the
-    appropriate list of PIL Images alongside a human-readable modality label.
+    appropriate list of PIL Images, a human-readable file-type label, and the
+    detected or inferred Modality.
 
     Parameters
     ----------
@@ -227,9 +290,11 @@ def process_uploaded_files(
 
     Returns
     -------
-    (images, modality_label)
-      images         : list[PIL.Image.Image]
-      modality_label : str  — e.g. "Image", "Video (16 frames)", "DICOM (32 slices)"
+    (images, file_label, modality)
+      images      : list[PIL.Image.Image]
+      file_label  : str      — e.g. "DICOM (32 slices)", "Video (16 frames)"
+      modality    : Modality — auto-detected from DICOM tag, or AUTO for
+                               image/video inputs (user can override in the UI)
 
     Raises
     ------
@@ -238,20 +303,24 @@ def process_uploaded_files(
     if not uploaded_files:
         raise ValueError("No files were provided.")
 
-    # Normalise to list
     if not isinstance(uploaded_files, list):
         uploaded_files = [uploaded_files]
 
-    first_name = Path(uploaded_files[0].name).suffix.lower()
+    first_ext = Path(uploaded_files[0].name).suffix.lower()
 
     # ── DICOM series ────────────────────────────────────────────────────────
-    if first_name in SUPPORTED_DICOM_EXTENSIONS:
-        # Sort by filename; a more robust approach would sort by InstanceNumber
+    if first_ext in SUPPORTED_DICOM_EXTENSIONS:
         sorted_files = sorted(uploaded_files, key=lambda f: f.name)
+
+        # Detect modality from the first file before pixel decoding resets it
+        detected_modality = detect_dicom_modality(sorted_files[0])
+
         images = load_dicom_series(sorted_files)
         if not images:
             raise ValueError("No valid DICOM slices could be decoded.")
-        return images, f"DICOM ({len(images)} slice{'s' if len(images) != 1 else ''})"
+
+        label = f"DICOM ({len(images)} slice{'s' if len(images) != 1 else ''})"
+        return images, label, detected_modality
 
     # ── Single-file inputs ───────────────────────────────────────────────────
     single_file = uploaded_files[0]
@@ -259,11 +328,11 @@ def process_uploaded_files(
 
     if ext in SUPPORTED_IMAGE_EXTENSIONS:
         images = load_image(single_file)
-        return images, "Image"
+        return images, "Image", Modality.AUTO
 
     if ext in SUPPORTED_VIDEO_EXTENSIONS:
         images = load_video(single_file, num_slices=num_video_slices)
-        return images, f"Video ({len(images)} frames)"
+        return images, f"Video ({len(images)} frames)", Modality.AUTO
 
     raise ValueError(
         f"Unsupported file type: '{ext}'. "

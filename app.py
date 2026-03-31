@@ -27,7 +27,10 @@ from PIL import Image
 
 import data_utils as du
 import model_engine as me
-from prompts import Task, build_task_config, CUSTOM_PROMPT_PLACEHOLDER
+from prompts import (
+    Task, Modality, MODALITY_SHORT,
+    build_task_config, CUSTOM_PROMPT_PLACEHOLDER,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page configuration
@@ -169,6 +172,34 @@ with st.sidebar:
             placeholder=CUSTOM_PROMPT_PLACEHOLDER,
         )
 
+    # ── Imaging modality selector ────────────────────────────────────────────
+    st.markdown('<p class="sidebar-section">Imaging Modality</p>', unsafe_allow_html=True)
+
+    # If DICOM files were already parsed and a modality was auto-detected,
+    # pre-select it in the dropdown; user can always override manually.
+    auto_detected: Modality = st.session_state.get("detected_modality", Modality.AUTO)
+    modality_options = [m.value for m in Modality]
+    default_idx = modality_options.index(auto_detected.value)
+
+    selected_modality_val = st.selectbox(
+        "Modality",
+        options=modality_options,
+        index=default_idx,
+        label_visibility="collapsed",
+        help=(
+            "For DICOM files this is auto-detected from the DICOM Modality tag "
+            "(0008,0060). For images and videos, select the correct modality "
+            "manually — this injects acquisition-specific context into the prompt "
+            "so the model reasons with the right imaging vocabulary."
+        ),
+    )
+    selected_modality = Modality(selected_modality_val)
+
+    if auto_detected != Modality.AUTO and auto_detected != Modality.OTHER:
+        st.caption(f"Auto-detected from DICOM tag: **{MODALITY_SHORT[auto_detected]}**")
+    elif auto_detected == Modality.OTHER:
+        st.caption("DICOM tag present but modality unrecognised — please select manually.")
+
     st.divider()
 
     # ── Advanced settings (collapsible) ─────────────────────────────────────
@@ -232,26 +263,30 @@ with left_col:
         uploaded_files = [uploaded_files]
 
     # Session state for parsed images so the preview persists
-    if "parsed_images"   not in st.session_state:
-        st.session_state.parsed_images   = []
-    if "modality_label"  not in st.session_state:
-        st.session_state.modality_label  = ""
-    if "parse_error"     not in st.session_state:
-        st.session_state.parse_error     = ""
+    if "parsed_images"      not in st.session_state:
+        st.session_state.parsed_images      = []
+    if "modality_label"     not in st.session_state:
+        st.session_state.modality_label     = ""
+    if "detected_modality"  not in st.session_state:
+        st.session_state.detected_modality  = Modality.AUTO
+    if "parse_error"        not in st.session_state:
+        st.session_state.parse_error        = ""
 
     if uploaded_files:
         try:
-            images, modality_label = du.process_uploaded_files(
+            images, file_label, detected_mod = du.process_uploaded_files(
                 uploaded_files,
                 num_video_slices=num_vid_slices,
             )
-            st.session_state.parsed_images  = images
-            st.session_state.modality_label = modality_label
-            st.session_state.parse_error    = ""
+            st.session_state.parsed_images     = images
+            st.session_state.modality_label    = file_label
+            st.session_state.detected_modality = detected_mod
+            st.session_state.parse_error       = ""
         except Exception as exc:
-            st.session_state.parsed_images  = []
-            st.session_state.modality_label = ""
-            st.session_state.parse_error    = str(exc)
+            st.session_state.parsed_images     = []
+            st.session_state.modality_label    = ""
+            st.session_state.detected_modality = Modality.AUTO
+            st.session_state.parse_error       = str(exc)
 
     # ── Preview ──────────────────────────────────────────────────────────────
     if st.session_state.parse_error:
@@ -261,7 +296,13 @@ with left_col:
         images       = st.session_state.parsed_images
         modality_lbl = st.session_state.modality_label
 
-        st.success(f"Loaded: **{modality_lbl}**  |  {len(images)} frame(s)")
+        det_mod  = st.session_state.detected_modality
+        mod_badge = (
+            f"  ·  Modality: **{MODALITY_SHORT[det_mod]}**"
+            if det_mod not in (Modality.AUTO, Modality.OTHER)
+            else ""
+        )
+        st.success(f"Loaded: **{modality_lbl}**  |  {len(images)} frame(s){mod_badge}")
 
         if len(images) == 1:
             st.image(images[0], use_container_width=True, caption="Input image")
@@ -319,6 +360,7 @@ with right_col:
                 task=selected_task,
                 disease=disease_name,
                 custom_prompt=custom_prompt,
+                modality=selected_modality,
             )
         except ValueError as ve:
             st.session_state.report_error = str(ve)

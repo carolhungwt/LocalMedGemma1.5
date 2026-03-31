@@ -1,12 +1,15 @@
 """
 prompts.py
 ──────────
-Defines all task identifiers, system-level radiologist persona, and
-user-facing prompt templates for MedGemma inference.
+Defines all task identifiers, modality context, system-level radiologist
+persona, and user-facing prompt templates for MedGemma inference.
 
 Design notes
-  • SYSTEM_PROMPT  — injected once as the "system" role in the chat template
-    to ground the model as a board-certified radiologist.
+  • Modality       — enum of supported imaging modalities; drives the modality
+                     context string prepended to every prompt so the model does
+                     not have to guess the acquisition type from pixel data.
+  • SYSTEM_PROMPT  — radiologist persona grounding; merged into the user turn
+                     because Gemma 3 has no "system" role.
   • TASK_PROMPTS   — user-visible task keys mapped to their template strings.
     Templates that contain {disease} require string .format() substitution
     before use.
@@ -18,6 +21,101 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Imaging modality
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Modality(str, Enum):
+    """
+    Supported imaging modalities.
+
+    Values match human-readable labels shown in the UI.
+    DICOM tag (0008,0060) values are mapped to these in data_utils.py.
+    AUTO is used when no modality is specified or detectable.
+    """
+    AUTO          = "Auto-detect"
+    XRAY          = "X-Ray"
+    CT            = "CT (Computed Tomography)"
+    MRI           = "MRI (Magnetic Resonance Imaging)"
+    ULTRASOUND    = "Ultrasound"
+    PET           = "PET / Nuclear Medicine"
+    FLUOROSCOPY   = "Fluoroscopy / Angiography"
+    MAMMOGRAPHY   = "Mammography"
+    OTHER         = "Other / Unknown"
+
+
+# Human-readable short labels used in the UI badge
+MODALITY_SHORT: dict[Modality, str] = {
+    Modality.AUTO        : "Auto",
+    Modality.XRAY        : "X-Ray",
+    Modality.CT          : "CT",
+    Modality.MRI         : "MRI",
+    Modality.ULTRASOUND  : "US",
+    Modality.PET         : "PET/NM",
+    Modality.FLUOROSCOPY : "XA/Fluoro",
+    Modality.MAMMOGRAPHY : "Mammo",
+    Modality.OTHER       : "Other",
+}
+
+# Per-modality context injected at the START of every prompt so the model
+# receives explicit acquisition context rather than inferring it from pixels.
+# This is particularly important for normalised/windowed images that can look
+# similar across modalities after uint8 conversion.
+MODALITY_CONTEXT: dict[Modality, str] = {
+    Modality.AUTO: (
+        "The imaging modality has not been specified. Infer it from the image "
+        "appearance and state your interpretation in the TECHNIQUE section."
+    ),
+    Modality.XRAY: (
+        "IMAGING MODALITY: Plain radiograph (X-Ray).\n"
+        "Interpret this study using standard radiographic conventions. "
+        "Assess for radio-opaque and radio-lucent abnormalities. "
+        "Reference standard projections (PA/AP, lateral) where relevant."
+    ),
+    Modality.CT: (
+        "IMAGING MODALITY: Computed Tomography (CT).\n"
+        "Apply Hounsfield Unit (HU) conventions where applicable. "
+        "Comment on window settings inferred from the image appearance "
+        "(lung, mediastinal, bone, or soft-tissue window). "
+        "If contrast enhancement is visible, note the phase (arterial, venous, delayed)."
+    ),
+    Modality.MRI: (
+        "IMAGING MODALITY: Magnetic Resonance Imaging (MRI).\n"
+        "Identify the likely pulse sequence (T1, T2, FLAIR, DWI, GRE, etc.) "
+        "from signal characteristics and describe findings accordingly. "
+        "Note signal intensity relative to reference tissues (e.g., CSF, fat, muscle)."
+    ),
+    Modality.ULTRASOUND: (
+        "IMAGING MODALITY: Ultrasound (US).\n"
+        "Describe echogenicity (anechoic, hypoechoic, isoechoic, hyperechoic), "
+        "through-transmission, and posterior acoustic features. "
+        "Comment on vascularity if Doppler information is visible."
+    ),
+    Modality.PET: (
+        "IMAGING MODALITY: PET / Nuclear Medicine.\n"
+        "Describe the distribution and intensity of radiotracer uptake. "
+        "Report focal areas of abnormal uptake using SUV terminology where visible. "
+        "Correlate with any co-registered anatomical imaging if present."
+    ),
+    Modality.FLUOROSCOPY: (
+        "IMAGING MODALITY: Fluoroscopy / Digital Subtraction Angiography (DSA).\n"
+        "Describe vessel opacification, luminal calibre, filling defects, "
+        "extravasation, or dynamic flow abnormalities visible in the frames provided."
+    ),
+    Modality.MAMMOGRAPHY: (
+        "IMAGING MODALITY: Mammography.\n"
+        "Use ACR BI-RADS terminology. Describe breast composition, masses "
+        "(shape, margin, density), calcifications (morphology, distribution), "
+        "architectural distortion, and asymmetries."
+    ),
+    Modality.OTHER: (
+        "IMAGING MODALITY: Not specified or non-standard.\n"
+        "Describe the imaging study as presented, noting any technical features "
+        "that help identify the acquisition method."
+    ),
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Task identifiers
@@ -114,27 +212,35 @@ class TaskConfig:
     ----------
     task         : The Task enum value selected by the user.
     user_prompt  : The final, fully-resolved prompt string (disease substituted,
-                   custom text included, etc.)
+                   custom text included, modality context prepended).
     system_prompt: The radiologist persona system prompt.
+    modality     : The imaging modality, used for display and prompt injection.
     """
     task         : Task
     user_prompt  : str
-    system_prompt: str = field(default_factory=lambda: SYSTEM_PROMPT)
+    system_prompt: str      = field(default_factory=lambda: SYSTEM_PROMPT)
+    modality     : Modality = Modality.AUTO
 
 
 def build_task_config(
     task         : Task,
-    disease      : str  = "",
-    custom_prompt: str  = "",
+    disease      : str      = "",
+    custom_prompt: str      = "",
+    modality     : Modality = Modality.AUTO,
 ) -> TaskConfig:
     """
     Resolve the correct prompt template and return a ready-to-use TaskConfig.
+
+    The modality context string is always prepended to the task prompt so the
+    model receives explicit acquisition context before the task instructions.
 
     Parameters
     ----------
     task          : Selected Task enum value.
     disease       : Required when task == Task.DISEASE_CLASSIFICATION.
     custom_prompt : Required when task == Task.CUSTOM_PROMPT.
+    modality      : Imaging modality — drives the context prefix injected into
+                    the prompt. Defaults to AUTO (model infers from pixels).
 
     Returns
     -------
@@ -150,14 +256,18 @@ def build_task_config(
                 "A disease or condition name must be provided for the "
                 "Disease Classification task."
             )
-        prompt = TASK_PROMPTS[task].format(disease=disease.strip())
+        task_text = TASK_PROMPTS[task].format(disease=disease.strip())
 
     elif task == Task.CUSTOM_PROMPT:
         if not custom_prompt.strip():
             raise ValueError("A custom prompt must be entered.")
-        prompt = custom_prompt.strip()
+        task_text = custom_prompt.strip()
 
     else:
-        prompt = TASK_PROMPTS[task]
+        task_text = TASK_PROMPTS[task]
 
-    return TaskConfig(task=task, user_prompt=prompt)
+    # Prepend the modality context so it is always the first thing the model reads
+    modality_prefix = MODALITY_CONTEXT.get(modality, MODALITY_CONTEXT[Modality.AUTO])
+    full_prompt = f"{modality_prefix}\n\n{task_text}"
+
+    return TaskConfig(task=task, user_prompt=full_prompt, modality=modality)
