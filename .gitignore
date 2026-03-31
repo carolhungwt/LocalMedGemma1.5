@@ -19,7 +19,7 @@ env/
 .cache/
 huggingface/
 
-# Streamlit
+# Streamlit — ignore secrets but commit the watcher fix
 .streamlit/secrets.toml
 
 # Jupyter

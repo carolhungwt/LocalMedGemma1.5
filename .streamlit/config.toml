@@ -1,0 +1,4 @@
+[server]
+# Prevents Streamlit's file watcher from trying to introspect torch.classes
+# internals, which raises a harmless but noisy RuntimeError on startup.
+fileWatcherType = "poll"
