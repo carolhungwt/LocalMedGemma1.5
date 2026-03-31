@@ -64,63 +64,6 @@ MODALITY_SHORT: dict[Modality, str] = {
     Modality.OTHER       : "Other",
 }
 
-# Per-modality context injected at the START of every prompt so the model
-# receives explicit acquisition context rather than inferring it from pixels.
-# This is particularly important for normalised/windowed images that can look
-# similar across modalities after uint8 conversion.
-MODALITY_CONTEXT: dict[Modality, str] = {
-    Modality.AUTO: (
-        "The imaging modality has not been specified. Infer it from the image "
-        "appearance and state your interpretation in the TECHNIQUE section."
-    ),
-    Modality.XRAY: (
-        "IMAGING MODALITY: Plain radiograph (X-Ray).\n"
-        "Interpret this study using standard radiographic conventions. "
-        "Assess for radio-opaque and radio-lucent abnormalities. "
-        "Reference standard projections (PA/AP, lateral) where relevant."
-    ),
-    Modality.CT: (
-        "IMAGING MODALITY: Computed Tomography (CT).\n"
-        "Apply Hounsfield Unit (HU) conventions where applicable. "
-        "Comment on window settings inferred from the image appearance "
-        "(lung, mediastinal, bone, or soft-tissue window). "
-        "If contrast enhancement is visible, note the phase (arterial, venous, delayed)."
-    ),
-    Modality.MRI: (
-        "IMAGING MODALITY: Magnetic Resonance Imaging (MRI).\n"
-        "Identify the likely pulse sequence (T1, T2, FLAIR, DWI, GRE, etc.) "
-        "from signal characteristics and describe findings accordingly. "
-        "Note signal intensity relative to reference tissues (e.g., CSF, fat, muscle)."
-    ),
-    Modality.ULTRASOUND: (
-        "IMAGING MODALITY: Ultrasound (US).\n"
-        "Describe echogenicity (anechoic, hypoechoic, isoechoic, hyperechoic), "
-        "through-transmission, and posterior acoustic features. "
-        "Comment on vascularity if Doppler information is visible."
-    ),
-    Modality.PET: (
-        "IMAGING MODALITY: PET / Nuclear Medicine.\n"
-        "Describe the distribution and intensity of radiotracer uptake. "
-        "Report focal areas of abnormal uptake using SUV terminology where visible. "
-        "Correlate with any co-registered anatomical imaging if present."
-    ),
-    Modality.FLUOROSCOPY: (
-        "IMAGING MODALITY: Fluoroscopy / Digital Subtraction Angiography (DSA).\n"
-        "Describe vessel opacification, luminal calibre, filling defects, "
-        "extravasation, or dynamic flow abnormalities visible in the frames provided."
-    ),
-    Modality.MAMMOGRAPHY: (
-        "IMAGING MODALITY: Mammography.\n"
-        "Use ACR BI-RADS terminology. Describe breast composition, masses "
-        "(shape, margin, density), calcifications (morphology, distribution), "
-        "architectural distortion, and asymmetries."
-    ),
-    Modality.OTHER: (
-        "IMAGING MODALITY: Not specified or non-standard.\n"
-        "Describe the imaging study as presented, noting any technical features "
-        "that help identify the acquisition method."
-    ),
-}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Anatomical body region
@@ -270,26 +213,48 @@ class XRayView(str, Enum):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Context builders — produce the lines inserted between modality block and task
+# Study context line builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_region_line(region: BodyRegion) -> str:
-    """Return a one-line region context string, or empty string if unspecified."""
-    if region == BodyRegion.UNSPECIFIED:
-        return ""
-    return (
-        f"ANATOMICAL REGION: {region.value}.\n"
-        "Focus your systematic review on this region. Describe adjacent "
-        "structures only where relevant to the primary findings."
+def _build_study_line(
+    modality   : "Modality",
+    region     : "BodyRegion",
+    xray_view  : "XRayView",
+    custom_view: str = "",
+) -> str:
+    """
+    Build the compact one-sentence study context injected between
+    SYSTEM_PROMPT and the task instructions:
+
+        "You are currently analysing <modality> of <region> in <view>."
+
+    Optional parts are omitted when not specified:
+      - region clause  : omitted when BodyRegion.UNSPECIFIED
+      - view clause    : omitted when not X-Ray or XRayView.UNSPECIFIED
+    """
+    mod_text = (
+        "an unspecified imaging study"
+        if modality in (Modality.AUTO, Modality.OTHER)
+        else modality.value
     )
 
+    region_clause = (
+        f" of the {region.value}"
+        if region != BodyRegion.UNSPECIFIED
+        else ""
+    )
 
-def _build_view_line(view: XRayView, custom_view: str = "") -> str:
-    """Return a one-line projection context string, or empty string if unspecified."""
-    if view == XRayView.UNSPECIFIED:
-        return ""
-    label = custom_view.strip() if view == XRayView.CUSTOM and custom_view.strip() else view.value
-    return f"RADIOGRAPHIC VIEW / PROJECTION: {label}."
+    if modality == Modality.XRAY and xray_view != XRayView.UNSPECIFIED:
+        view_label = (
+            custom_view.strip()
+            if xray_view == XRayView.CUSTOM and custom_view.strip()
+            else xray_view.value
+        )
+        view_clause = f" in {view_label}"
+    else:
+        view_clause = ""
+
+    return f"You are currently analysing {mod_text}{region_clause}{view_clause}."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -328,12 +293,12 @@ TASK_PROMPTS: dict[Task, str] = {
         "Analyze this medical imaging study. "
         "Provide a comprehensive structured report covering:\n"
         "  • TECHNIQUE: Describe the imaging modality, plane(s), and any contrast use "
-        "    visible from the images.\n"
+        "visible from the images.\n"
         "  • FINDINGS: Systematically describe the appearance of all visible anatomical "
-        "    structures — report both normal and abnormal findings. Note size, "
-        "    morphology, density/signal, and distribution of any lesion or abnormality.\n"
+        "structures — report both normal and abnormal findings. Note size, "
+        "morphology, density/signal, and distribution of any lesion or abnormality.\n"
         "  • IMPRESSION: Summarise the most clinically significant findings and "
-        "    provide a prioritised differential diagnosis list."
+        "provide a prioritised differential diagnosis list."
     ),
 
     Task.DISEASE_CLASSIFICATION: (
@@ -454,18 +419,9 @@ def build_task_config(
     else:
         task_text = TASK_PROMPTS[task]
 
-    # ── Assemble context blocks ───────────────────────────────────────────────
-    modality_block = MODALITY_CONTEXT.get(modality, MODALITY_CONTEXT[Modality.AUTO])
-    region_line    = _build_region_line(region)
-    view_line      = (
-        _build_view_line(xray_view, custom_view)
-        if modality == Modality.XRAY
-        else ""
-    )
-
-    # Join non-empty sections with blank lines for readability
-    context_parts = [modality_block] + [s for s in (region_line, view_line) if s]
-    full_prompt   = "\n\n".join(context_parts) + "\n\n" + task_text
+    # Single compact study context line placed between system prompt and task
+    study_line  = _build_study_line(modality, region, xray_view, custom_view)
+    full_prompt = f"{study_line}\n\n{task_text}"
 
     return TaskConfig(
         task=task,
