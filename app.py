@@ -109,13 +109,19 @@ with st.sidebar:
 
     # ── Authentication ───────────────────────────────────────────────────────
     st.markdown('<p class="sidebar-section">Hugging Face Access</p>', unsafe_allow_html=True)
+
+    weights_cached = me._is_model_cached(me.MODEL_ID)
+    if weights_cached:
+        st.success("Model weights cached locally — no token needed.", icon="✅")
+
     hf_token = st.text_input(
-        "HF Token",
+        "HF Token" if not weights_cached else "HF Token (optional)",
         type="password",
-        placeholder="hf_...",
+        placeholder="hf_..." if not weights_cached else "Not required — weights are local",
         help=(
-            "Required to download the gated MedGemma model. "
-            "Get yours at huggingface.co/settings/tokens"
+            "Only needed for the **first download** of the gated MedGemma model. "
+            "Once weights are cached locally this field can be left blank. "
+            "Get a token at huggingface.co/settings/tokens"
         ),
     )
 
@@ -284,10 +290,15 @@ with right_col:
     if "report_error" not in st.session_state:
         st.session_state.report_error = ""
 
-    analyse_ready = bool(st.session_state.parsed_images) and bool(hf_token)
+    # Token only required when weights aren't cached yet
+    token_ok     = bool(hf_token) or me._is_model_cached(me.MODEL_ID)
+    analyse_ready = bool(st.session_state.parsed_images) and token_ok
 
-    if not hf_token:
-        st.warning("Enter your Hugging Face token in the sidebar to enable analysis.")
+    if not token_ok:
+        st.warning(
+            "First-time setup: enter your Hugging Face token in the sidebar "
+            "to download the model. You won't need it again after that."
+        )
     elif not st.session_state.parsed_images:
         st.info("Upload a medical image to enable the Analyse button.")
 

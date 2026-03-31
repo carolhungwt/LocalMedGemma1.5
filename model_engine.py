@@ -23,6 +23,7 @@ from typing import Optional
 
 import streamlit as st
 import torch
+from huggingface_hub import scan_cache_dir
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -105,51 +106,85 @@ def load_model(hf_token: Optional[str] = None) -> tuple:
 
     Raises
     ------
-    EnvironmentError  if no token is found and the model requires authentication.
+    EnvironmentError  if weights are not cached locally AND no token is provided.
     RuntimeError      if model loading fails for any other reason.
     """
     hw = get_hardware_info()
 
-    # Resolve authentication token
+    # Resolve token (optional when weights are already cached locally)
     token = (
         hf_token
         or os.getenv("HF_TOKEN")
         or os.getenv("HUGGING_FACE_HUB_TOKEN")
+        or None
     )
-    if not token:
+
+    # Check whether the model weights already exist in the local HF cache.
+    # from_pretrained() needs no token at all when loading purely from disk.
+    weights_cached = _is_model_cached(MODEL_ID)
+
+    if not weights_cached and not token:
         raise EnvironmentError(
-            "A Hugging Face access token is required to download "
-            f"'{MODEL_ID}' (gated model). "
-            "Provide it in the sidebar or set the HF_TOKEN environment variable."
+            f"'{MODEL_ID}' is not in the local cache and no Hugging Face "
+            "token was provided.\n\n"
+            "First-time setup: enter your token in the sidebar (or set the "
+            "HF_TOKEN environment variable) to download the model weights. "
+            "After the first successful download you will never need the "
+            "token again on this machine."
         )
+
+    # Pass token only when needed; avoids unnecessary network calls on
+    # subsequent runs where everything is served from local disk.
+    auth = {"token": token} if token else {}
 
     try:
         processor = AutoProcessor.from_pretrained(
             MODEL_ID,
-            token=token,
-            use_fast=True,          # suppress slow-processor deprecation warning
+            use_fast=True,
             trust_remote_code=True,
+            **auth,
         )
 
         model = AutoModelForImageTextToText.from_pretrained(
             MODEL_ID,
-            token=token,
-            dtype=hw["dtype"],      # torch_dtype= is deprecated; use dtype=
+            dtype=hw["dtype"],
             device_map="auto",
             trust_remote_code=True,
+            **auth,
         )
         model.eval()
 
     except Exception as exc:
+        # Surface a clear message distinguishing auth vs. other failures
+        err = str(exc).lower()
+        if any(k in err for k in ("401", "403", "gated", "access", "forbidden", "unauthorized")):
+            raise EnvironmentError(
+                f"Authentication failed for '{MODEL_ID}'.\n\n"
+                "  • Make sure your token is valid and not revoked.\n"
+                "  • Confirm you have accepted the model license at "
+                "huggingface.co/google/medgemma-1.5-4b-it."
+            ) from exc
         raise RuntimeError(
             f"Failed to load '{MODEL_ID}': {exc}\n\n"
             "Possible causes:\n"
-            "  • Invalid or expired Hugging Face token.\n"
-            "  • You have not accepted the model's license on huggingface.co.\n"
-            "  • Insufficient disk space or network error during download."
+            "  • Insufficient disk space or a corrupted cache "
+            "(try deleting ~/.cache/huggingface/hub/models--google--medgemma-1.5-4b-it).\n"
+            "  • Network error during a partial download."
         ) from exc
 
     return processor, model, hw
+
+
+def _is_model_cached(model_id: str) -> bool:
+    """Return True if *any* revision of model_id exists in the local HF cache."""
+    try:
+        cache = scan_cache_dir()
+        for repo in cache.repos:
+            if repo.repo_id == model_id:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
